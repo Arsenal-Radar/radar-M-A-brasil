@@ -1,0 +1,92 @@
+"""Página: Sobre o sistema."""
+
+import streamlit as st
+
+
+def render():
+    st.title("📋 Sobre o Radar M&A Brasil")
+
+    st.markdown("""
+    ### O que é este sistema?
+
+    O **Radar M&A Brasil** é uma ferramenta privada de originação de deals para M&A.
+    Ele varre automaticamente fontes públicas brasileiras em busca de empresas
+    **não listadas na B3** com **EBITDA acima de R$ 40 milhões**.
+
+    ---
+
+    ### Como funciona?
+
+    ```
+    Fontes públicas          Processamento            Resultado
+    ─────────────────        ─────────────────        ──────────────────
+    Diários Oficiais    →    Leitura de PDFs     →    Banco de dados
+    JUCEs estaduais     →    Extração de dados   →    Dashboard filtrado
+    DOU (Seção 3)       →    Cálculo de EBITDA   →    Exportação CSV/Excel
+    ```
+
+    ---
+
+    ### Fontes de dados
+    """)
+
+    fontes = [
+        ("🏛️ Diário Oficial da União (DOU)", "Seção 3 — atos societários e publicações legais obrigatórias"),
+        ("📰 Diários Oficiais Estaduais", "SP, RJ, MG, RS, PR, SC, BA, GO, PE, CE e demais estados"),
+        ("🏢 JUCEs estaduais", "Juntas Comerciais — arquivamento de demonstrações contábeis"),
+        ("📊 Publicações legais obrigatórias", "SA fechadas são obrigadas por lei a publicar balanços"),
+    ]
+
+    for nome, desc in fontes:
+        st.markdown(f"**{nome}**  \n{desc}")
+        st.markdown("")
+
+    st.markdown("""
+    ---
+
+    ### Filtros aplicados automaticamente
+
+    | Critério | Regra |
+    |---|---|
+    | EBITDA | > R$ 40 milhões |
+    | Listagem | Excluídas empresas da B3 |
+    | Tipo societário | LTDA e S.A. fechadas |
+    | Período | Últimos 2 anos fechados (2024 e 2025) |
+    | Fonte | Apenas publicações oficiais verificadas |
+
+    ---
+
+    ### Como usar — passo a passo
+
+    1. **Comece pelos dados de demonstração** — vá em ⚙️ *Coletar Dados* e clique em *Carregar dados de demonstração*
+    2. **Explore o dashboard** — veja métricas, gráficos e ranking das maiores empresas
+    3. **Use os filtros** — em 🔍 *Buscar Empresas*, filtre por EBITDA, estado, setor e margem
+    4. **Exporte** — baixe os resultados em CSV ou Excel para seu CRM ou planilha
+    5. **Colete dados reais** — quando quiser atualizar, use ⚙️ *Coletar Dados* → fontes automatizadas
+
+    ---
+
+    ### Stack tecnológico
+
+    | Componente | Tecnologia |
+    |---|---|
+    | Interface | Streamlit |
+    | Banco de dados | SQLite (local) |
+    | Scraping | requests + BeautifulSoup |
+    | PDF parsing | pdfplumber + Tesseract OCR |
+    | Gráficos | Plotly |
+    | Exportação | pandas + openpyxl |
+
+    ---
+
+    ### Limitações importantes
+
+    - **PDFs escaneados**: documentos de baixa qualidade podem ter extração imprecisa (indicado pelo % de confiança)
+    - **Padronização**: cada Diário Oficial tem seu próprio formato — cobertura cresce com o tempo
+    - **EBITDA inferido**: quando não publicado diretamente, é calculado como Lucro Operacional + D&A
+    - **Atualização**: dados são estáticos até você executar uma nova coleta
+
+    ---
+    """)
+
+    st.info("🔒 Este sistema é privado. Os dados coletados ficam apenas no seu banco de dados local.")
