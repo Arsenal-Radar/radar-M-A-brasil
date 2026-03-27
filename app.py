@@ -214,52 +214,28 @@ def _inlabs_collect(email, senha, sess, lcb=None):
                            timeout=15)
         if lcb: lcb(f"  🔍 Login JSON: status={r_json.status_code} cookies={dict(sess.cookies)}")
 
-        cookie = sess.cookies.get("inlabs_session_cookie","")
+        # Verificar se a sessão tem cookies (qualquer cookie válido indica login OK)
+        session_cookies = dict(sess.cookies)
+        if lcb: lcb(f"  🔍 Cookies após login: {list(session_cookies.keys())}")
 
-        if not cookie:
-            # Tentar formato form-data
-            r_form = sess.post(INLABS_LOGIN,
-                               data={"email": email, "senha": senha,
-                                     "acao": "logar"},
-                               timeout=15,
-                               headers={**HDR, "Content-Type": "application/x-www-form-urlencoded"})
-            if lcb: lcb(f"  🔍 Login form: status={r_form.status_code} cookies={dict(sess.cookies)}")
-            cookie = sess.cookies.get("inlabs_session_cookie","")
+        if not session_cookies:
+            # Tentar formato form com campo 'acao'
+            sess2 = requests.Session()
+            sess2.headers.update(HDR)
+            r_form = sess2.post(INLABS_LOGIN,
+                                data={"email": email, "senha": senha, "acao": "logar"},
+                                timeout=15)
+            if lcb: lcb(f"  🔍 Login form v2: {r_form.status_code} cookies={list(dict(sess2.cookies).keys())}")
+            if sess2.cookies:
+                sess = sess2  # usar esta sessão
+                session_cookies = dict(sess.cookies)
 
-            if not cookie:
-                # Procurar token em qualquer cookie
-                all_cookies = dict(sess.cookies)
-                if lcb: lcb(f"  🔍 Todos os cookies: {all_cookies}")
-                # Pegar qualquer cookie que pareça um token
-                for k,v in all_cookies.items():
-                    if len(v) > 10:
-                        cookie = v
-                        if lcb: lcb(f"  ℹ️ Usando cookie '{k}'")
-                        break
-
-            if not cookie:
-                # Tentar extrair JWT do body da resposta
-                body = r_form.text
-                if lcb: lcb(f"  🔍 Body (primeiros 200 chars): {body[:200]}")
-                import re as re2
-                for pattern in [
-                    r'"token"\s*:\s*"([^"]+)"',
-                    r'"jwt"\s*:\s*"([^"]+)"',
-                    r'"access_token"\s*:\s*"([^"]+)"',
-                    r'inlabs_session_cookie[^=]*=([^\s;]+)',
-                ]:
-                    m = re2.search(pattern, body)
-                    if m:
-                        cookie = m.group(1)
-                        if lcb: lcb(f"  ℹ️ Token extraído do body: {cookie[:20]}...")
-                        break
-
-        if not cookie:
-            if lcb: lcb("❌ Login InLabs falhou — cookie não encontrado. Verifique email/senha.")
-            if lcb: lcb("   Acesse inlabs.in.gov.br no navegador para confirmar que suas credenciais funcionam.")
+        if not session_cookies:
+            if lcb: lcb("❌ Login InLabs falhou. Verifique email/senha em inlabs.in.gov.br")
             return results
 
-        if lcb: lcb(f"✅ InLabs: login OK — token obtido")
+        if lcb: lcb(f"✅ InLabs: login OK — sessão ativa com {len(session_cookies)} cookie(s)")
+        # Daqui em diante usar sess diretamente — ela já carrega todos os cookies
 
     except Exception as e:
         if lcb: lcb(f"❌ Login InLabs: {e}")
@@ -284,7 +260,7 @@ def _inlabs_collect(email, senha, sess, lcb=None):
         page_url = f"{INLABS_INDEX}?p={date_str}"
         try:
             rp = sess.get(page_url,
-                          cookies={"inlabs_session_cookie": cookie},
+                          # cookies gerenciados automaticamente pela sessão
                           timeout=20)
             rp.raise_for_status()
 
@@ -316,7 +292,7 @@ def _inlabs_collect(email, senha, sess, lcb=None):
             for dl_url in dl_links:
                 try:
                     ra = sess.get(dl_url, timeout=60,
-                                  cookies={"inlabs_session_cookie": cookie},
+                                  # cookies gerenciados automaticamente pela sessão
                                   stream=True)
                     # 404 significa que esse arquivo não existe nesta data
                     if ra.status_code == 404:
@@ -331,6 +307,12 @@ def _inlabs_collect(email, senha, sess, lcb=None):
 
                     if lcb:
                         lcb(f"  📥 {dl_url.split('dl=')[-1]} ({len(raw_bytes)//1024}KB)")
+                    # Diagnóstico: verificar se é HTML (redirecionamento) ou arquivo real
+                    preview = raw_bytes[:100].decode("utf-8", errors="ignore").strip()
+                    if preview.startswith("<!") or preview.startswith("<html") or "<HTML" in preview.upper()[:50]:
+                        if lcb: lcb(f"  ⚠️ Recebeu HTML em vez do arquivo — sessão pode ter expirado")
+                        if lcb: lcb(f"     Preview: {preview[:80]}")
+                        continue
 
                     # ZIP → extrair XMLs internos
                     if dl_url.endswith(".zip") or "zip" in content_type:
