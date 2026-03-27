@@ -588,7 +588,7 @@ elif "Coletar" in pg:
             st.success(f"✅ {n} empresas carregadas! Vá para 🔍 Buscar Empresas."); st.balloons()
     st.markdown("---"); st.subheader("🤖 Coleta automatizada")
     st.warning("⚠️ A coleta real acessa servidores públicos e pode levar 30min a várias horas.")
-    fs=st.multiselect("Fontes",list(SRCS.keys()),default=["DOU (União)","Diário Oficial SP"])
+    fs=st.multiselect("Fontes",list(SRCS.keys()),default=["DOU Seção 3","QD - SP"])
     if st.button(f"🚀 Iniciar coleta ({len(fs)} fonte(s))",type="primary",disabled=len(fs)==0):
         lb=st.empty(); pr=st.progress(0); al=[]
         for i,nm in enumerate(fs):
