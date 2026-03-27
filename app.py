@@ -193,8 +193,8 @@ HDR = {
 # ── InLabs: API oficial gratuita da Imprensa Nacional ───────────────────────
 # Cadastro em: https://inlabs.in.gov.br (gratuito, email + senha)
 # Dá acesso a XMLs completos do DOU sem bloqueio
-INLABS_LOGIN = "https://inlabs.in.gov.br/logar.php"
-INLABS_API   = "https://inlabs.in.gov.br/opendata.php"
+INLABS_LOGIN  = "https://inlabs.in.gov.br/logar.php"
+INLABS_INDEX  = "https://inlabs.in.gov.br/index.php"
 
 def _inlabs_collect(email, senha, sess, lcb=None):
     """
@@ -266,76 +266,113 @@ def _inlabs_collect(email, senha, sess, lcb=None):
         return results
 
     # 2) Varrer datas — últimos 365 dias, Seção 3
+    # URL real descoberta via DevTools:
+    # index.php?p=YYYY-MM-DD&dl=YYYY_MM_DD_ASSINADO_do3.pdf  (PDF assinado)
+    # index.php?p=YYYY-MM-DD                                  (página com lista de arquivos)
     today = datetime.now()
     dias_varridos = 0
+
     for days_back in range(0, 365):
         d = today - timedelta(days=days_back)
-        # Pular fins de semana (DOU não publica)
-        if d.weekday() >= 5:
+        if d.weekday() >= 5:  # Pular fins de semana
             continue
-        date_str = d.strftime("%Y-%m-%d")
+
+        date_str  = d.strftime("%Y-%m-%d")        # 2026-03-27
+        date_file = d.strftime("%Y_%m_%d")        # 2026_03_27
+
+        # Primeiro: carregar a página do dia para ver quais arquivos existem
+        page_url = f"{INLABS_INDEX}?p={date_str}"
         try:
-            params = {
-                "a": "arquivos",
-                "data": date_str,
-                "secao": "do3",  # Seção 3 = atos societários
-            }
-            r = sess.get(INLABS_API, params=params,
-                         cookies={"inlabs_session_cookie": cookie},
-                         timeout=20)
-            r.raise_for_status()
+            rp = sess.get(page_url,
+                          cookies={"inlabs_session_cookie": cookie},
+                          timeout=20)
+            rp.raise_for_status()
 
-            # Resposta pode ser JSON ou HTML
-            try:
-                data = r.json()
-            except Exception:
-                data = {}
-
-            arquivos = data.get("arquivos", [])
-            if not arquivos:
-                # Tentar extrair links diretos
-                from bs4 import BeautifulSoup as BS
-                soup = BS(r.text, "html.parser")
-                for a in soup.select("a[href*='.zip'], a[href*='.xml']"):
-                    href = a.get("href","")
+            # Extrair lista de arquivos disponíveis para download
+            soup = BeautifulSoup(rp.text, "html.parser")
+            dl_links = []
+            for a in soup.select("a[href*='dl=']"):
+                href = a.get("href","")
+                if "do3" in href.lower() or "DO3" in href:
                     if not href.startswith("http"):
-                        href = "https://inlabs.in.gov.br" + href
-                    arquivos.append({"url": href, "nome": href.split("/")[-1]})
+                        href = "https://inlabs.in.gov.br/" + href.lstrip("/")
+                    dl_links.append(href)
 
-            if arquivos and lcb:
-                lcb(f"  📅 {date_str}: {len(arquivos)} arquivo(s) Seção 3")
+            # Se não encontrou links explícitos, tentar URLs conhecidas
+            if not dl_links:
+                # Formato ZIP (XML) — preferível ao PDF
+                for sufixo in [
+                    f"{date_file}-DO3.zip",
+                    f"{date_file}_ASSINADO_do3.pdf",
+                    f"{date_file}-do3.zip",
+                ]:
+                    dl_links.append(
+                        f"{INLABS_INDEX}?p={date_str}&dl={sufixo}"
+                    )
 
-            for arq in arquivos:
-                url_arq = arq.get("url","") or arq.get("link","")
-                if not url_arq:
-                    continue
+            if lcb and dl_links:
+                lcb(f"  📅 {date_str}: {len(dl_links)} arquivo(s) DO3")
+
+            for dl_url in dl_links:
                 try:
-                    ra = sess.get(url_arq, timeout=30,
-                                  cookies={"inlabs_session_cookie": cookie})
+                    ra = sess.get(dl_url, timeout=60,
+                                  cookies={"inlabs_session_cookie": cookie},
+                                  stream=True)
+                    # 404 significa que esse arquivo não existe nesta data
+                    if ra.status_code == 404:
+                        continue
                     ra.raise_for_status()
 
-                    # ZIP com XMLs
-                    if url_arq.endswith(".zip") or "zip" in ra.headers.get("content-type",""):
-                        zf = zipfile.ZipFile(io.BytesIO(ra.content))
-                        for fname in zf.namelist():
-                            raw = zf.read(fname).decode("utf-8", errors="ignore")
-                            novos = _parse_xml_dou(raw, url_arq, lcb)
-                            results.extend(novos)
+                    content_type = ra.headers.get("content-type","")
+                    raw_bytes = ra.content
+
+                    if not raw_bytes or len(raw_bytes) < 100:
+                        continue
+
+                    if lcb:
+                        lcb(f"  📥 {dl_url.split('dl=')[-1]} ({len(raw_bytes)//1024}KB)")
+
+                    # ZIP → extrair XMLs internos
+                    if dl_url.endswith(".zip") or "zip" in content_type:
+                        try:
+                            zf = zipfile.ZipFile(io.BytesIO(raw_bytes))
+                            for fname in zf.namelist():
+                                raw_text = zf.read(fname).decode("utf-8", errors="ignore")
+                                novos = _parse_xml_dou(raw_text, dl_url, lcb)
+                                results.extend(novos)
+                        except Exception as ze:
+                            if lcb: lcb(f"  ⚠️ ZIP: {ze}")
+
+                    # PDF → extrair texto com pdfplumber
+                    elif dl_url.lower().endswith(".pdf") or "pdf" in content_type:
+                        try:
+                            import pdfplumber, io as _io
+                            with pdfplumber.open(_io.BytesIO(raw_bytes)) as pdf:
+                                pages_text = []
+                                for page in pdf.pages[:60]:
+                                    t = page.extract_text()
+                                    if t: pages_text.append(t)
+                            full_text = "\n".join(pages_text)
+                            if lcb: lcb(f"  📄 PDF: {len(full_text)} chars extraídos")
+                            for b in _blocks(full_text):
+                                res = extr_fin(b, dl_url, "INLABS_DOU3", "BR")
+                                if res: results.append(res)
+                        except Exception as pe:
+                            if lcb: lcb(f"  ⚠️ PDF: {pe}")
+
                     # XML direto
-                    elif url_arq.endswith(".xml") or "xml" in ra.headers.get("content-type",""):
-                        novos = _parse_xml_dou(ra.text, url_arq, lcb)
-                        results.extend(novos)
-                    # Texto puro
                     else:
-                        for b in _blocks(ra.text):
-                            res = extr_fin(b, url_arq, "INLABS_DOU3", "BR")
-                            if res: results.append(res)
+                        text = raw_bytes.decode("utf-8", errors="ignore")
+                        novos = _parse_xml_dou(text, dl_url, lcb)
+                        results.extend(novos)
+
+                    time.sleep(0.5)
 
                 except Exception as fe:
-                    if lcb: lcb(f"  ⚠️ arquivo {url_arq[-40:]}: {fe}")
+                    if lcb: lcb(f"  ⚠️ {dl_url[-50:]}: {fe}")
 
             dias_varridos += 1
-            time.sleep(0.5)  # Ser gentil com o servidor
+            time.sleep(0.3)
 
         except Exception as de:
             if lcb: lcb(f"  ⚠️ {date_str}: {de}")
