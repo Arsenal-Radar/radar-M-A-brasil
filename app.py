@@ -185,39 +185,179 @@ def extr_fin(text,url,tipo,uf):
             "ano_referencia":extr_yr(text),"fonte_url":url,"fonte_tipo":tipo,
             "fonte_uf":uf,"confianca_extracao":round(min(cf,1.0),3)}
 
-HDR={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+HDR={"User-Agent":"Mozilla/5.0 (compatible; RadarMA/1.0; +https://github.com)","Accept":"application/json"}
 
-def collect(nome,url,uf,lcb=None):
-    s=requests.Session(); s.headers.update(HDR)
-    st2={"f":0,"v":0,"e":0,"log":[]}
+# ── Querido Diário API (diários municipais e estaduais) ─────────────────────
+QD_BASE = "https://api.queridodiario.ok.org.br"
+
+# Principais municípios brasileiros por código IBGE
+# (capitais + cidades com maior atividade empresarial)
+QD_TERRITORIES = [
+    ("3550308","SP"),("3304557","RJ"),("3106200","MG"),("4314902","RS"),
+    ("4106902","PR"),("4205407","SC"),("2927408","BA"),("5208707","GO"),
+    ("2304400","CE"),("2111300","MA"),("5103403","MT"),("5002704","MS"),
+    ("1302603","AM"),("1501402","PA"),("2611606","PE"),("2704302","AL"),
+    ("2800308","SE"),("2211001","PI"),("2408102","RN"),("2507507","PB"),
+    ("1100205","RO"),("1200401","AC"),("1600303","AP"),("1400100","RR"),
+    ("1721000","TO"),("5300108","DF"),("3205309","ES"),
+]
+
+QD_TERMS = [
+    "demonstrações financeiras",
+    "balanço patrimonial LTDA",
+    "balanço patrimonial S.A",
+    "resultado do exercício LTDA",
+    "demonstrações contábeis",
+]
+
+# ── DOU XML aberto (Imprensa Nacional) ─────────────────────────────────────
+DOU_XML_BASE = "https://www.in.gov.br/acesso-a-informacao/dados-abertos/base-de-dados"
+# URL direta dos arquivos XML mensais
+DOU_XML_URL  = "https://pesquisa.in.gov.br/imprensa/servlet/INPDFViewer"
+
+# API de busca do DOU (mesma usada pelo site oficial)
+DOU_SEARCH   = "https://www.in.gov.br/consulta/-/buscar/dou"
+
+def _qd_collect(territory_id, uf, term, sess, lcb=None):
+    """Busca no Querido Diário via API oficial."""
+    results = []
+    try:
+        params = {
+            "querystring": term,
+            "territory_ids": territory_id,
+            "since": "2024-01-01",
+            "size": 10,
+            "excerpt_size": 1000,
+            "number_of_excerpts": 3,
+        }
+        r = sess.get(f"{QD_BASE}/gazettes", params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        gazettes = data.get("gazettes", [])
+        for g in gazettes:
+            excerpts = g.get("excerpts", [])
+            full_text = " ".join(excerpts)
+            url = g.get("url","")
+            res = extr_fin(full_text, url, "QUERIDO_DIARIO", uf)
+            if res:
+                results.append(res)
+                if lcb: lcb(f"  📄 {g.get('territory_name',uf)} {g.get('date','')} → encontrado")
+    except Exception as e:
+        if lcb: lcb(f"  ⚠️ QD {territory_id}: {e}")
+    return results
+
+def _dou_collect(term, sess, lcb=None):
+    """Busca no DOU via API da Imprensa Nacional (mesma do site oficial)."""
+    results = []
+    try:
+        params = {
+            "q": term,
+            "s": "do3",           # Seção 3 = atos societários
+            "exactDate": "personalizado",
+            "data": "01/01/2024",
+            "dataFim": "31/12/2025",
+            "orgPub": "",
+        }
+        r = sess.get(DOU_SEARCH, params=params, timeout=20,
+                     headers={**HDR, "Accept":"text/html,application/xhtml+xml"})
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # Tentar extrair resultados da página de busca
+        items = (soup.select(".resultado-dou-item") or
+                 soup.select("article") or
+                 soup.select(".search-result-item"))
+
+        for item in items[:20]:
+            link = item.select_one("a[href]")
+            if not link: continue
+            href = link.get("href","")
+            if not href.startswith("http"):
+                href = "https://www.in.gov.br" + href
+            try:
+                r2 = sess.get(href, timeout=15)
+                r2.raise_for_status()
+                text = BeautifulSoup(r2.text,"html.parser").get_text(" ")
+                res = extr_fin(text, href, "DOU_SECAO3", "BR")
+                if res:
+                    results.append(res)
+                    if lcb: lcb(f"  📄 DOU → {res.get('company_name','?')[:40]}")
+                time.sleep(1.5)
+            except: pass
+
+        # Fallback: extrair texto direto da página de resultados
+        page_text = soup.get_text(" ")
+        res = extr_fin(page_text, DOU_SEARCH, "DOU_SECAO3", "BR")
+        if res:
+            results.append(res)
+
+    except Exception as e:
+        if lcb: lcb(f"  ⚠️ DOU: {e}")
+    return results
+
+def collect(nome, url, uf, lcb=None):
+    """
+    Orquestrador principal. Para fontes QD usa a API.
+    Para DOU usa a API oficial. Fallback para scraping simples.
+    """
+    sess = requests.Session()
+    sess.headers.update(HDR)
+    st2 = {"f":0,"v":0,"e":0,"log":[]}
+
     def log(m):
         st2["log"].append(m)
         if lcb: lcb(m)
-    log(f"Iniciando: {nome}")
-    try:
-        for term in ["demonstrações financeiras","balanço patrimonial LTDA"]:
+
+    log(f"▶ Iniciando: {nome}")
+
+    collected = []
+
+    if nome == "Querido Diário (todos estados)":
+        # Varre todos os territórios cadastrados
+        for tid, tuf in QD_TERRITORIES:
+            for term in QD_TERMS[:2]:   # 2 termos por território
+                log(f"  🔍 {tuf} ({tid}) · '{term}'")
+                res = _qd_collect(tid, tuf, term, sess, lcb)
+                collected.extend(res)
+                time.sleep(1)
+
+    elif nome.startswith("QD -"):
+        # Estado específico
+        state = nome.replace("QD - ","")
+        for tid, tuf in QD_TERRITORIES:
+            if tuf == state:
+                for term in QD_TERMS:
+                    res = _qd_collect(tid, tuf, term, sess, lcb)
+                    collected.extend(res)
+                    time.sleep(1)
+
+    elif nome == "DOU Seção 3":
+        for term in QD_TERMS:
+            log(f"  🔍 DOU · '{term}'")
+            res = _dou_collect(term, sess, lcb)
+            collected.extend(res)
+            time.sleep(2)
+
+    else:
+        # Coletor genérico (fallback)
+        for term in ["demonstrações financeiras","balanço patrimonial"]:
             try:
-                r=s.get(url,params={"q":term,"ano":"2024"},timeout=15); r.raise_for_status()
-                soup=BeautifulSoup(r.text,"html.parser"); text=soup.get_text(" ")
-                res=extr_fin(text,url,nome,uf)
-                if res: st2["f"]+=1; _sv(res,st2,log)
+                r = sess.get(url, params={"q":term}, timeout=15)
+                r.raise_for_status()
+                text = BeautifulSoup(r.text,"html.parser").get_text(" ")
+                res = extr_fin(text, url, nome, uf)
+                if res: collected.append(res)
                 time.sleep(2)
-                from urllib.parse import urljoin
-                for lk in soup.select("a[href]")[:10]:
-                    href=lk.get("href",""); txt=lk.get_text("").lower()
-                    if any(k in txt for k in ["balanço","demonstração","resultado","financei"]):
-                        full=urljoin(url,href) if not href.startswith("http") else href
-                        try:
-                            r2=s.get(full,timeout=15); r2.raise_for_status()
-                            t2=BeautifulSoup(r2.text,"html.parser").get_text(" ")
-                            r3=extr_fin(t2,full,nome,uf)
-                            if r3: st2["f"]+=1; _sv(r3,st2,log)
-                            time.sleep(2)
-                        except: pass
-            except Exception as e: log(f"⚠️ {e}")
-    except Exception as e: log(f"❌ {e}")
-    log(f"Concluído: {st2['f']} encontrados, {st2['v']} salvos")
-    log_run(nome,uf,"done",st2["f"],st2["v"],st2["v"],"\n".join(st2["log"]))
+            except Exception as e:
+                log(f"  ⚠️ {e}")
+
+    # Salvar tudo que foi encontrado
+    st2["f"] = len(collected)
+    for res in collected:
+        _sv(res, st2, log)
+
+    log(f"✅ Concluído: {st2['f']} encontrados, {st2['v']} salvos")
+    log_run(nome, uf, "done", st2["f"], st2["v"], st2["v"], "\n".join(st2["log"]))
     return st2
 
 def _sv(res,st2,log):
@@ -230,18 +370,24 @@ def _sv(res,st2,log):
         log(f"✅ {cd['razao_social'][:50]} | EBITDA R${res['ebitda']/1e6:.1f}M")
     except Exception as e: st2["e"]+=1; log(f"⚠️ {e}")
 
+# ── Fontes disponíveis no menu ───────────────────────────────────────────────
 SRCS={
-    "DOU (União)":       ("https://www.in.gov.br/consulta/-/buscar/dou","BR"),
-    "Diário Oficial SP": ("https://www.imprensaoficial.com.br","SP"),
-    "Diário Oficial RJ": ("https://www.ioerj.com.br","RJ"),
-    "Diário Oficial MG": ("https://www.iof.mg.gov.br","MG"),
-    "Diário Oficial RS": ("https://www.ioergs.rs.gov.br","RS"),
-    "Diário Oficial PR": ("https://www.dioe.pr.gov.br","PR"),
-    "Diário Oficial SC": ("https://www.diario.sc.gov.br","SC"),
-    "Diário Oficial BA": ("https://www.egba.ba.gov.br","BA"),
-    "Diário Oficial GO": ("https://www.goias.gov.br/diario-oficial","GO"),
-    "Diário Oficial CE": ("https://www.ceara.gov.br/diario-oficial","CE"),
-    "Diário Oficial MA": ("https://www.stc.ma.gov.br/doe","MA"),
+    "Querido Diário (todos estados)": ("", "BR"),
+    "QD - SP": ("", "SP"),
+    "QD - RJ": ("", "RJ"),
+    "QD - MG": ("", "MG"),
+    "QD - RS": ("", "RS"),
+    "QD - PR": ("", "PR"),
+    "QD - SC": ("", "SC"),
+    "QD - BA": ("", "BA"),
+    "QD - GO": ("", "GO"),
+    "QD - CE": ("", "CE"),
+    "QD - PE": ("", "PE"),
+    "QD - MA": ("", "MA"),
+    "QD - MT": ("", "MT"),
+    "QD - MS": ("", "MS"),
+    "QD - DF": ("", "DF"),
+    "DOU Seção 3": (DOU_SEARCH, "BR"),
 }
 
 DEMO=[
