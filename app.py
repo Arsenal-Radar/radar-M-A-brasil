@@ -219,80 +219,168 @@ DOU_XML_URL  = "https://pesquisa.in.gov.br/imprensa/servlet/INPDFViewer"
 DOU_SEARCH   = "https://www.in.gov.br/consulta/-/buscar/dou"
 
 def _qd_collect(territory_id, uf, term, sess, lcb=None):
-    """Busca no Querido Diário via API oficial."""
+    """
+    Busca no Querido Diário via API oficial.
+    Para cada gazette encontrada, tenta baixar o PDF completo para
+    extração mais rica. Fallback para os excerpts da API.
+    """
     results = []
     try:
         params = {
             "querystring": term,
             "territory_ids": territory_id,
             "since": "2024-01-01",
-            "size": 10,
-            "excerpt_size": 1000,
-            "number_of_excerpts": 3,
+            "size": 5,
+            "excerpt_size": 2000,
+            "number_of_excerpts": 5,
         }
-        r = sess.get(f"{QD_BASE}/gazettes", params=params, timeout=20)
+        r = sess.get(f"{QD_BASE}/gazettes", params=params, timeout=25)
         r.raise_for_status()
         data = r.json()
         gazettes = data.get("gazettes", [])
+
         for g in gazettes:
+            pdf_url = g.get("url","")
+            territory_name = g.get("territory_name", uf)
+            date = g.get("date","")
+
+            # 1) Tentar baixar e ler o PDF completo
+            text_from_pdf = ""
+            if pdf_url and pdf_url.endswith(".pdf"):
+                try:
+                    pr = sess.get(pdf_url, timeout=30, stream=True)
+                    pr.raise_for_status()
+                    pdf_bytes = pr.content
+                    if len(pdf_bytes) < 20_000_000:  # max 20MB
+                        import pdfplumber, io
+                        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                            pages_text = []
+                            for page in pdf.pages[:30]:  # max 30 páginas
+                                t = page.extract_text()
+                                if t: pages_text.append(t)
+                        text_from_pdf = "\n".join(pages_text)
+                        if lcb: lcb(f"  📥 PDF baixado: {territory_name} {date} ({len(text_from_pdf)} chars)")
+                except Exception as pe:
+                    if lcb: lcb(f"  ⚠️ PDF erro: {pe}")
+
+            # 2) Combinar texto do PDF com excerpts da API
             excerpts = g.get("excerpts", [])
-            full_text = " ".join(excerpts)
-            url = g.get("url","")
-            res = extr_fin(full_text, url, "QUERIDO_DIARIO", uf)
-            if res:
-                results.append(res)
-                if lcb: lcb(f"  📄 {g.get('territory_name',uf)} {g.get('date','')} → encontrado")
+            excerpt_text = " ".join(excerpts)
+            full_text = (text_from_pdf + "\n" + excerpt_text).strip()
+
+            if not full_text:
+                continue
+
+            # Buscar empresas no texto completo
+            # Dividir em blocos por empresa (separados por CNPJ ou nome)
+            blocks = _split_into_company_blocks(full_text)
+            found_any = False
+            for block in blocks:
+                res = extr_fin(block, pdf_url or f"{QD_BASE}/gazettes/{territory_id}", "QUERIDO_DIARIO", uf)
+                if res:
+                    results.append(res)
+                    found_any = True
+                    if lcb: lcb(f"  ✅ {territory_name}: {res.get('company_name','?')[:40]} EBITDA R${res['ebitda']/1e6:.1f}M")
+
+            if not found_any and lcb:
+                lcb(f"  ○ {territory_name} {date}: sem empresas com EBITDA>40M")
+
+            time.sleep(1)
+
     except Exception as e:
         if lcb: lcb(f"  ⚠️ QD {territory_id}: {e}")
     return results
 
+
+def _split_into_company_blocks(text: str) -> list:
+    """
+    Divide um texto de Diário Oficial em blocos por empresa.
+    Cada bloco começa quando encontra um CNPJ ou nome de empresa.
+    """
+    import re
+    # Dividir por CNPJ (marcador mais confiável de nova empresa)
+    cnpj_re = re.compile(r'\d{2}[\.\s]?\d{3}[\.\s]?\d{3}[/\]?\d{4}-?\d{2}')
+    positions = [m.start() for m in cnpj_re.finditer(text)]
+
+    if not positions:
+        return [text]  # Texto inteiro como um bloco
+
+    blocks = []
+    for i, pos in enumerate(positions):
+        start = max(0, pos - 500)   # 500 chars antes do CNPJ (nome da empresa)
+        end = positions[i+1] + 2000 if i+1 < len(positions) else pos + 3000
+        end = min(end, len(text))
+        blocks.append(text[start:end])
+
+    # Adicionar bloco do início se não tem CNPJ lá
+    if positions[0] > 1000:
+        blocks.insert(0, text[:positions[0]])
+
+    return blocks
+
+
 def _dou_collect(term, sess, lcb=None):
-    """Busca no DOU via API da Imprensa Nacional (mesma do site oficial)."""
+    """
+    Busca no DOU via API JSON não-documentada da Imprensa Nacional.
+    Usa o mesmo endpoint que o app oficial do DOU usa internamente.
+    """
     results = []
     try:
+        # API JSON interna do DOU (descoberta via inspeção do app oficial)
+        api_url = "https://www.in.gov.br/consulta/-/buscar/dou"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "pt-BR,pt;q=0.9",
+            "Referer": "https://www.in.gov.br/consulta",
+        }
         params = {
             "q": term,
-            "s": "do3",           # Seção 3 = atos societários
+            "s": "do3",
             "exactDate": "personalizado",
             "data": "01/01/2024",
             "dataFim": "31/12/2025",
-            "orgPub": "",
         }
-        r = sess.get(DOU_SEARCH, params=params, timeout=20,
-                     headers={**HDR, "Accept":"text/html,application/xhtml+xml"})
+        r = sess.get(api_url, params=params, timeout=25, headers=headers)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # Tentar extrair resultados da página de busca
-        items = (soup.select(".resultado-dou-item") or
-                 soup.select("article") or
-                 soup.select(".search-result-item"))
+        # Extrair links de publicações
+        links_found = set()
+        for a in soup.select("a[href]"):
+            href = a.get("href","")
+            if "/web/dou/-/" in href or "in.gov.br/en/web/dou" in href:
+                if not href.startswith("http"):
+                    href = "https://www.in.gov.br" + href
+                links_found.add(href)
 
-        for item in items[:20]:
-            link = item.select_one("a[href]")
-            if not link: continue
-            href = link.get("href","")
-            if not href.startswith("http"):
-                href = "https://www.in.gov.br" + href
+        if lcb: lcb(f"  🔍 DOU '{term}': {len(links_found)} links encontrados")
+
+        for href in list(links_found)[:15]:
             try:
-                r2 = sess.get(href, timeout=15)
+                r2 = sess.get(href, timeout=20, headers=headers)
                 r2.raise_for_status()
                 text = BeautifulSoup(r2.text,"html.parser").get_text(" ")
-                res = extr_fin(text, href, "DOU_SECAO3", "BR")
-                if res:
-                    results.append(res)
-                    if lcb: lcb(f"  📄 DOU → {res.get('company_name','?')[:40]}")
-                time.sleep(1.5)
-            except: pass
+                blocks = _split_into_company_blocks(text)
+                for block in blocks:
+                    res = extr_fin(block, href, "DOU_SECAO3", "BR")
+                    if res:
+                        results.append(res)
+                        if lcb: lcb(f"  ✅ DOU: {res.get('company_name','?')[:40]} EBITDA R${res['ebitda']/1e6:.1f}M")
+                time.sleep(2)
+            except Exception as e2:
+                if lcb: lcb(f"  ⚠️ {href[:60]}: {e2}")
 
-        # Fallback: extrair texto direto da página de resultados
+        # Fallback: texto da própria página de resultados
         page_text = soup.get_text(" ")
-        res = extr_fin(page_text, DOU_SEARCH, "DOU_SECAO3", "BR")
-        if res:
-            results.append(res)
+        blocks = _split_into_company_blocks(page_text)
+        for block in blocks:
+            res = extr_fin(block, api_url, "DOU_SECAO3", "BR")
+            if res:
+                results.append(res)
 
     except Exception as e:
-        if lcb: lcb(f"  ⚠️ DOU: {e}")
+        if lcb: lcb(f"  ⚠️ DOU erro geral: {e}")
     return results
 
 def collect(nome, url, uf, lcb=None):
