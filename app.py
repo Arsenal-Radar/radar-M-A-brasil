@@ -117,7 +117,7 @@ def log_run(f,u,s,df=0,dp=0,en=0,lt=""):
         c.execute("INSERT INTO pipeline_runs(fonte,uf,status,docs_found,docs_parsed,empresas_novas,started_at,finished_at,log_text) VALUES(?,?,?,?,?,?,datetime('now'),datetime('now'),?)",(f,u,s,df,dp,en,lt))
 
 MR=re.compile(r'(\d{1,3}(?:\.\d{3})+(?:,\d{2})?|\d{5,}(?:,\d{2})?)')
-CR=re.compile(r'\d{2}\.?\d{3}\.?\d{3}[/\\]?\d{4}-?\d{2}')
+CR=re.compile(r'\d{2}[.\s]?\d{3}[.\s]?\d{3}[/]?\d{4}[-]?\d{2}')
 RL=["receita líquida","receita operacional líquida","receita de vendas"]
 EL=["ebitda","lajida","resultado antes dos juros","resultado operacional antes"]
 LL=["lucro líquido do exercício","resultado líquido do período","lucro (prejuízo) líquido"]
@@ -230,6 +230,7 @@ def _qd_collect(territory_id, uf, term, sess, lcb=None):
             "querystring": term,
             "territory_ids": territory_id,
             "since": "2024-01-01",
+            "until": "2025-12-31",
             "size": 5,
             "excerpt_size": 2000,
             "number_of_excerpts": 5,
@@ -293,30 +294,26 @@ def _qd_collect(territory_id, uf, term, sess, lcb=None):
 
 
 def _split_into_company_blocks(text: str) -> list:
-    """
-    Divide um texto de Diário Oficial em blocos por empresa.
-    Cada bloco começa quando encontra um CNPJ ou nome de empresa.
-    """
-    import re
-    # Dividir por CNPJ (marcador mais confiável de nova empresa)
-    cnpj_re = re.compile(r'\d{2}[\.\s]?\d{3}[\.\s]?\d{3}[/\]?\d{4}-?\d{2}')
-    positions = [m.start() for m in cnpj_re.finditer(text)]
-
-    if not positions:
-        return [text]  # Texto inteiro como um bloco
-
-    blocks = []
-    for i, pos in enumerate(positions):
-        start = max(0, pos - 500)   # 500 chars antes do CNPJ (nome da empresa)
-        end = positions[i+1] + 2000 if i+1 < len(positions) else pos + 3000
-        end = min(end, len(text))
-        blocks.append(text[start:end])
-
-    # Adicionar bloco do início se não tem CNPJ lá
-    if positions[0] > 1000:
-        blocks.insert(0, text[:positions[0]])
-
-    return blocks
+    """Divide texto em blocos por empresa usando CNPJ como marcador."""
+    try:
+        pat = re.compile(r'\d{2}\.\d{3}\.\d{3}[/]\d{4}[-]\d{2}')
+        positions = [m.start() for m in pat.finditer(text)]
+        if not positions:
+            pat2 = re.compile(r'\d{14}')
+            positions = [m.start() for m in pat2.finditer(text)]
+        if not positions:
+            return [text]
+        blocks = []
+        for i, pos in enumerate(positions):
+            start = max(0, pos - 500)
+            end = positions[i+1] + 2000 if i+1 < len(positions) else pos + 3000
+            end = min(end, len(text))
+            blocks.append(text[start:end])
+        if positions[0] > 1000:
+            blocks.insert(0, text[:positions[0]])
+        return blocks
+    except Exception:
+        return [text]
 
 
 def _dou_collect(term, sess, lcb=None):
