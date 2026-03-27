@@ -185,206 +185,179 @@ def extr_fin(text,url,tipo,uf):
             "ano_referencia":extr_yr(text),"fonte_url":url,"fonte_tipo":tipo,
             "fonte_uf":uf,"confianca_extracao":round(min(cf,1.0),3)}
 
-HDR={"User-Agent":"Mozilla/5.0 (compatible; RadarMA/1.0; +https://github.com)","Accept":"application/json"}
+HDR = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept-Language": "pt-BR,pt;q=0.9",
+}
 
-# ── Querido Diário API (diários municipais e estaduais) ─────────────────────
-QD_BASE = "https://api.queridodiario.ok.org.br"
+# ── InLabs: API oficial gratuita da Imprensa Nacional ───────────────────────
+# Cadastro em: https://inlabs.in.gov.br (gratuito, email + senha)
+# Dá acesso a XMLs completos do DOU sem bloqueio
+INLABS_LOGIN = "https://inlabs.in.gov.br/logar.php"
+INLABS_API   = "https://inlabs.in.gov.br/opendata.php"
 
-# Principais municípios brasileiros por código IBGE
-# (capitais + cidades com maior atividade empresarial)
-QD_TERRITORIES = [
-    ("3550308","SP"),("3304557","RJ"),("3106200","MG"),("4314902","RS"),
-    ("4106902","PR"),("4205407","SC"),("2927408","BA"),("5208707","GO"),
-    ("2304400","CE"),("2111300","MA"),("5103403","MT"),("5002704","MS"),
-    ("1302603","AM"),("1501402","PA"),("2611606","PE"),("2704302","AL"),
-    ("2800308","SE"),("2211001","PI"),("2408102","RN"),("2507507","PB"),
-    ("1100205","RO"),("1200401","AC"),("1600303","AP"),("1400100","RR"),
-    ("1721000","TO"),("5300108","DF"),("3205309","ES"),
-]
-
-QD_TERMS = [
-    "demonstrações financeiras",
-    "balanço patrimonial LTDA",
-    "balanço patrimonial S.A",
-    "resultado do exercício LTDA",
-    "demonstrações contábeis",
-]
-
-# ── DOU XML aberto (Imprensa Nacional) ─────────────────────────────────────
-DOU_XML_BASE = "https://www.in.gov.br/acesso-a-informacao/dados-abertos/base-de-dados"
-# URL direta dos arquivos XML mensais
-DOU_XML_URL  = "https://pesquisa.in.gov.br/imprensa/servlet/INPDFViewer"
-
-# API de busca do DOU (mesma usada pelo site oficial)
-DOU_SEARCH   = "https://www.in.gov.br/consulta/-/buscar/dou"
-
-def _qd_collect(territory_id, uf, term, sess, lcb=None):
+def _inlabs_collect(email, senha, sess, lcb=None):
     """
-    Busca no Querido Diário via API oficial.
-    Para cada gazette encontrada, tenta baixar o PDF completo para
-    extração mais rica. Fallback para os excerpts da API.
+    Baixa XMLs do DOU Seção 3 via InLabs (API oficial da Imprensa Nacional).
+    Varre os últimos 365 dias, dia por dia, extraindo DFs de empresas.
     """
+    import zipfile, io, xml.etree.ElementTree as ET
+    from datetime import datetime, timedelta
     results = []
+
+    # 1) Login
     try:
-        params = {
-            "querystring": term,
-            "territory_ids": territory_id,
-            "since": "2024-01-01",
-            "until": "2025-12-31",
-            "size": 5,
-            "excerpt_size": 2000,
-            "number_of_excerpts": 5,
-        }
-        r = sess.get(f"{QD_BASE}/gazettes", params=params, timeout=25)
-        r.raise_for_status()
-        data = r.json()
-        gazettes = data.get("gazettes", [])
-
-        for g in gazettes:
-            pdf_url = g.get("url","")
-            territory_name = g.get("territory_name", uf)
-            date = g.get("date","")
-
-            # 1) Tentar baixar e ler o PDF completo
-            text_from_pdf = ""
-            if pdf_url and pdf_url.endswith(".pdf"):
-                try:
-                    pr = sess.get(pdf_url, timeout=30, stream=True)
-                    pr.raise_for_status()
-                    pdf_bytes = pr.content
-                    if len(pdf_bytes) < 20_000_000:  # max 20MB
-                        import pdfplumber, io
-                        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                            pages_text = []
-                            for page in pdf.pages[:30]:  # max 30 páginas
-                                t = page.extract_text()
-                                if t: pages_text.append(t)
-                        text_from_pdf = "\n".join(pages_text)
-                        if lcb: lcb(f"  📥 PDF baixado: {territory_name} {date} ({len(text_from_pdf)} chars)")
-                except Exception as pe:
-                    if lcb: lcb(f"  ⚠️ PDF erro: {pe}")
-
-            # 2) Combinar texto do PDF com excerpts da API
-            excerpts = g.get("excerpts", [])
-            excerpt_text = " ".join(excerpts)
-            full_text = (text_from_pdf + "\n" + excerpt_text).strip()
-
-            if not full_text:
-                continue
-
-            # Buscar empresas no texto completo
-            # Dividir em blocos por empresa (separados por CNPJ ou nome)
-            blocks = _split_into_company_blocks(full_text)
-            found_any = False
-            for block in blocks:
-                res = extr_fin(block, pdf_url or f"{QD_BASE}/gazettes/{territory_id}", "QUERIDO_DIARIO", uf)
-                if res:
-                    results.append(res)
-                    found_any = True
-                    if lcb: lcb(f"  ✅ {territory_name}: {res.get('company_name','?')[:40]} EBITDA R${res['ebitda']/1e6:.1f}M")
-
-            if not found_any and lcb:
-                lcb(f"  ○ {territory_name} {date}: sem empresas com EBITDA>40M")
-
-            time.sleep(1)
-
+        r = sess.post(INLABS_LOGIN,
+                      data={"email": email, "senha": senha},
+                      timeout=15)
+        # Capturar cookie de sessão
+        cookie = sess.cookies.get("inlabs_session_cookie","")
+        if not cookie:
+            # Tentar extrair do body
+            import re as re2
+            m = re2.search(r'inlabs_session_cookie["\s:=]+([a-zA-Z0-9_\-]+)', r.text)
+            cookie = m.group(1) if m else ""
+        if not cookie:
+            if lcb: lcb("❌ Login InLabs falhou. Verifique email/senha em Configurações.")
+            return results
+        if lcb: lcb("✅ InLabs: login OK")
     except Exception as e:
-        if lcb: lcb(f"  ⚠️ QD {territory_id}: {e}")
+        if lcb: lcb(f"❌ Login InLabs: {e}")
+        return results
+
+    # 2) Varrer datas — últimos 365 dias, Seção 3
+    today = datetime.now()
+    dias_varridos = 0
+    for days_back in range(0, 365):
+        d = today - timedelta(days=days_back)
+        # Pular fins de semana (DOU não publica)
+        if d.weekday() >= 5:
+            continue
+        date_str = d.strftime("%Y-%m-%d")
+        try:
+            params = {
+                "a": "arquivos",
+                "data": date_str,
+                "secao": "do3",  # Seção 3 = atos societários
+            }
+            r = sess.get(INLABS_API, params=params,
+                         cookies={"inlabs_session_cookie": cookie},
+                         timeout=20)
+            r.raise_for_status()
+
+            # Resposta pode ser JSON ou HTML
+            try:
+                data = r.json()
+            except Exception:
+                data = {}
+
+            arquivos = data.get("arquivos", [])
+            if not arquivos:
+                # Tentar extrair links diretos
+                from bs4 import BeautifulSoup as BS
+                soup = BS(r.text, "html.parser")
+                for a in soup.select("a[href*='.zip'], a[href*='.xml']"):
+                    href = a.get("href","")
+                    if not href.startswith("http"):
+                        href = "https://inlabs.in.gov.br" + href
+                    arquivos.append({"url": href, "nome": href.split("/")[-1]})
+
+            if arquivos and lcb:
+                lcb(f"  📅 {date_str}: {len(arquivos)} arquivo(s) Seção 3")
+
+            for arq in arquivos:
+                url_arq = arq.get("url","") or arq.get("link","")
+                if not url_arq:
+                    continue
+                try:
+                    ra = sess.get(url_arq, timeout=30,
+                                  cookies={"inlabs_session_cookie": cookie})
+                    ra.raise_for_status()
+
+                    # ZIP com XMLs
+                    if url_arq.endswith(".zip") or "zip" in ra.headers.get("content-type",""):
+                        zf = zipfile.ZipFile(io.BytesIO(ra.content))
+                        for fname in zf.namelist():
+                            raw = zf.read(fname).decode("utf-8", errors="ignore")
+                            novos = _parse_xml_dou(raw, url_arq, lcb)
+                            results.extend(novos)
+                    # XML direto
+                    elif url_arq.endswith(".xml") or "xml" in ra.headers.get("content-type",""):
+                        novos = _parse_xml_dou(ra.text, url_arq, lcb)
+                        results.extend(novos)
+                    # Texto puro
+                    else:
+                        for b in _blocks(ra.text):
+                            res = extr_fin(b, url_arq, "INLABS_DOU3", "BR")
+                            if res: results.append(res)
+
+                except Exception as fe:
+                    if lcb: lcb(f"  ⚠️ arquivo {url_arq[-40:]}: {fe}")
+
+            dias_varridos += 1
+            time.sleep(0.5)  # Ser gentil com o servidor
+
+        except Exception as de:
+            if lcb: lcb(f"  ⚠️ {date_str}: {de}")
+
+    if lcb: lcb(f"\n📊 InLabs: {dias_varridos} dias varridos, {len(results)} registros com EBITDA>R$40M")
     return results
 
 
-def _split_into_company_blocks(text: str) -> list:
+def _parse_xml_dou(xml_text: str, url: str, lcb=None) -> list:
+    """Extrai publicações de um XML do DOU e procura dados financeiros."""
+    import xml.etree.ElementTree as ET
+    results = []
+    try:
+        root = ET.fromstring(xml_text)
+        # Estrutura do DOU: <article> ou <publicacao> com <body> ou <texto>
+        for elem in root.iter():
+            if elem.tag.lower() in ("article","publicacao","body","texto","conteudo"):
+                texto = (elem.text or "") + " ".join(c.text or "" for c in elem)
+                if len(texto) < 100:
+                    continue
+                for b in _blocks(texto):
+                    res = extr_fin(b, url, "INLABS_DOU3", "BR")
+                    if res:
+                        results.append(res)
+                        if lcb: lcb(f"  ✅ {res.get('company_name','?')[:40]} R${res['ebitda']/1e6:.0f}M")
+    except ET.ParseError:
+        # Não é XML válido, tratar como texto
+        for b in _blocks(xml_text):
+            res = extr_fin(b, url, "INLABS_DOU3", "BR")
+            if res: results.append(res)
+    return results
+
+
+def _blocks(text: str) -> list:
     """Divide texto em blocos por empresa usando CNPJ como marcador."""
     try:
-        pat = re.compile(r'\d{2}\.\d{3}\.\d{3}[/]\d{4}[-]\d{2}')
+        pat = re.compile(r"\d{2}\.\d{3}\.\d{3}[/]\d{4}[-]\d{2}")
         positions = [m.start() for m in pat.finditer(text)]
         if not positions:
-            pat2 = re.compile(r'\d{14}')
-            positions = [m.start() for m in pat2.finditer(text)]
-        if not positions:
-            return [text]
+            return [text] if len(text) > 100 else []
         blocks = []
         for i, pos in enumerate(positions):
             start = max(0, pos - 500)
             end = positions[i+1] + 2000 if i+1 < len(positions) else pos + 3000
             end = min(end, len(text))
             blocks.append(text[start:end])
-        if positions[0] > 1000:
-            blocks.insert(0, text[:positions[0]])
         return blocks
     except Exception:
         return [text]
 
 
-def _dou_collect(term, sess, lcb=None):
-    """
-    Busca no DOU via API JSON não-documentada da Imprensa Nacional.
-    Usa o mesmo endpoint que o app oficial do DOU usa internamente.
-    """
+def process_manual_text(text: str, fonte: str = "MANUAL") -> list:
+    """Processa texto colado manualmente."""
     results = []
-    try:
-        # API JSON interna do DOU (descoberta via inspeção do app oficial)
-        api_url = "https://www.in.gov.br/consulta/-/buscar/dou"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "pt-BR,pt;q=0.9",
-            "Referer": "https://www.in.gov.br/consulta",
-        }
-        params = {
-            "q": term,
-            "s": "do3",
-            "exactDate": "personalizado",
-            "data": "01/01/2024",
-            "dataFim": "31/12/2025",
-        }
-        r = sess.get(api_url, params=params, timeout=25, headers=headers)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        # Extrair links de publicações
-        links_found = set()
-        for a in soup.select("a[href]"):
-            href = a.get("href","")
-            if "/web/dou/-/" in href or "in.gov.br/en/web/dou" in href:
-                if not href.startswith("http"):
-                    href = "https://www.in.gov.br" + href
-                links_found.add(href)
-
-        if lcb: lcb(f"  🔍 DOU '{term}': {len(links_found)} links encontrados")
-
-        for href in list(links_found)[:15]:
-            try:
-                r2 = sess.get(href, timeout=20, headers=headers)
-                r2.raise_for_status()
-                text = BeautifulSoup(r2.text,"html.parser").get_text(" ")
-                blocks = _split_into_company_blocks(text)
-                for block in blocks:
-                    res = extr_fin(block, href, "DOU_SECAO3", "BR")
-                    if res:
-                        results.append(res)
-                        if lcb: lcb(f"  ✅ DOU: {res.get('company_name','?')[:40]} EBITDA R${res['ebitda']/1e6:.1f}M")
-                time.sleep(2)
-            except Exception as e2:
-                if lcb: lcb(f"  ⚠️ {href[:60]}: {e2}")
-
-        # Fallback: texto da própria página de resultados
-        page_text = soup.get_text(" ")
-        blocks = _split_into_company_blocks(page_text)
-        for block in blocks:
-            res = extr_fin(block, api_url, "DOU_SECAO3", "BR")
-            if res:
-                results.append(res)
-
-    except Exception as e:
-        if lcb: lcb(f"  ⚠️ DOU erro geral: {e}")
+    for b in (_blocks(text) or [text]):
+        res = extr_fin(b, fonte, "MANUAL", "BR")
+        if res: results.append(res)
     return results
 
-def collect(nome, url, uf, lcb=None):
-    """
-    Orquestrador principal. Para fontes QD usa a API.
-    Para DOU usa a API oficial. Fallback para scraping simples.
-    """
+
+def collect(nome, url, uf, lcb=None, email="", senha=""):
+    """Orquestrador de coleta."""
     sess = requests.Session()
     sess.headers.update(HDR)
     st2 = {"f":0,"v":0,"e":0,"log":[]}
@@ -393,50 +366,19 @@ def collect(nome, url, uf, lcb=None):
         st2["log"].append(m)
         if lcb: lcb(m)
 
-    log(f"▶ Iniciando: {nome}")
-
+    log(f"▶ {nome}")
     collected = []
 
-    if nome == "Querido Diário (todos estados)":
-        # Varre todos os territórios cadastrados
-        for tid, tuf in QD_TERRITORIES:
-            for term in QD_TERMS[:2]:   # 2 termos por território
-                log(f"  🔍 {tuf} ({tid}) · '{term}'")
-                res = _qd_collect(tid, tuf, term, sess, lcb)
-                collected.extend(res)
-                time.sleep(1)
+    try:
+        if nome == "InLabs DOU Seção 3" and email and senha:
+            collected = _inlabs_collect(email, senha, sess, log)
+        elif nome == "InLabs DOU Seção 3":
+            log("⚠️ Configure seu email e senha do InLabs nas Configurações abaixo.")
+        else:
+            log(f"Fonte não configurada: {nome}")
+    except Exception as e:
+        log(f"❌ {e}")
 
-    elif nome.startswith("QD -"):
-        # Estado específico
-        state = nome.replace("QD - ","")
-        for tid, tuf in QD_TERRITORIES:
-            if tuf == state:
-                for term in QD_TERMS:
-                    res = _qd_collect(tid, tuf, term, sess, lcb)
-                    collected.extend(res)
-                    time.sleep(1)
-
-    elif nome == "DOU Seção 3":
-        for term in QD_TERMS:
-            log(f"  🔍 DOU · '{term}'")
-            res = _dou_collect(term, sess, lcb)
-            collected.extend(res)
-            time.sleep(2)
-
-    else:
-        # Coletor genérico (fallback)
-        for term in ["demonstrações financeiras","balanço patrimonial"]:
-            try:
-                r = sess.get(url, params={"q":term}, timeout=15)
-                r.raise_for_status()
-                text = BeautifulSoup(r.text,"html.parser").get_text(" ")
-                res = extr_fin(text, url, nome, uf)
-                if res: collected.append(res)
-                time.sleep(2)
-            except Exception as e:
-                log(f"  ⚠️ {e}")
-
-    # Salvar tudo que foi encontrado
     st2["f"] = len(collected)
     for res in collected:
         _sv(res, st2, log)
@@ -445,34 +387,25 @@ def collect(nome, url, uf, lcb=None):
     log_run(nome, uf, "done", st2["f"], st2["v"], st2["v"], "\n".join(st2["log"]))
     return st2
 
-def _sv(res,st2,log):
-    try:
-        cd={"cnpj":res.get("cnpj") or f"SEM_{st2['f']:05d}",
-            "razao_social":res.get("company_name") or "Não identificada",
-            "uf":res.get("fonte_uf"),"municipio":None,
-            "setor":inf_s(res.get("company_name","")),"tipo_sociedade":inf_t(res.get("company_name",""))}
-        cid=upsert_co(cd); upsert_st(cid,res); st2["v"]+=1
-        log(f"✅ {cd['razao_social'][:50]} | EBITDA R${res['ebitda']/1e6:.1f}M")
-    except Exception as e: st2["e"]+=1; log(f"⚠️ {e}")
 
-# ── Fontes disponíveis no menu ───────────────────────────────────────────────
-SRCS={
-    "Querido Diário (todos estados)": ("", "BR"),
-    "QD - SP": ("", "SP"),
-    "QD - RJ": ("", "RJ"),
-    "QD - MG": ("", "MG"),
-    "QD - RS": ("", "RS"),
-    "QD - PR": ("", "PR"),
-    "QD - SC": ("", "SC"),
-    "QD - BA": ("", "BA"),
-    "QD - GO": ("", "GO"),
-    "QD - CE": ("", "CE"),
-    "QD - PE": ("", "PE"),
-    "QD - MA": ("", "MA"),
-    "QD - MT": ("", "MT"),
-    "QD - MS": ("", "MS"),
-    "QD - DF": ("", "DF"),
-    "DOU Seção 3": (DOU_SEARCH, "BR"),
+def _sv(res, st2, log):
+    try:
+        cd = {"cnpj": res.get("cnpj") or f"SEM_{st2['f']:05d}",
+              "razao_social": res.get("company_name") or "Não identificada",
+              "uf": res.get("fonte_uf"), "municipio": None,
+              "setor": inf_s(res.get("company_name","")),
+              "tipo_sociedade": inf_t(res.get("company_name",""))}
+        cid = upsert_co(cd)
+        upsert_st(cid, res)
+        st2["v"] += 1
+        log(f"✅ {cd['razao_social'][:50]} | EBITDA R${res['ebitda']/1e6:.1f}M")
+    except Exception as e:
+        st2["e"] += 1
+        log(f"⚠️ {e}")
+
+
+SRCS = {
+    "InLabs DOU Seção 3": ("", "BR"),
 }
 
 DEMO=[
@@ -671,17 +604,104 @@ elif "Coletar" in pg:
         if st.button("⚡ Carregar dados de demonstração",type="primary"):
             with st.spinner("Carregando..."): n=load_demo()
             st.success(f"✅ {n} empresas carregadas! Vá para 🔍 Buscar Empresas."); st.balloons()
-    st.markdown("---"); st.subheader("🤖 Coleta automatizada")
-    st.warning("⚠️ A coleta real acessa servidores públicos e pode levar 30min a várias horas.")
-    fs=st.multiselect("Fontes",list(SRCS.keys()),default=["DOU Seção 3","QD - SP"])
-    if st.button(f"🚀 Iniciar coleta ({len(fs)} fonte(s))",type="primary",disabled=len(fs)==0):
-        lb=st.empty(); pr=st.progress(0); al=[]
-        for i,nm in enumerate(fs):
-            pr.progress(int(i/len(fs)*100),text=f"Coletando: {nm}...")
-            url,uf=SRCS[nm]
-            def cb(m,_l=al): _l.append(m); lb.text_area("Log","\n".join(_l[-30:]),height=250)
-            collect(nm,url,uf,lcb=cb)
-        pr.progress(100,text="Concluído!"); st.success("✅ Coleta finalizada!")
+    st.markdown("---")
+    st.subheader("📋 Importação manual de texto")
+    st.write(
+        "**A forma mais confiável de adicionar dados.** "
+        "Copie o texto de qualquer publicação de balanço "
+        "(DOU, Diário Oficial estadual, JUCE) e cole abaixo. "
+        "O sistema extrai automaticamente os dados financeiros."
+    )
+    with st.expander("📖 Como fazer — passo a passo", expanded=False):
+        st.markdown("""
+        1. Acesse **[in.gov.br/consulta](https://www.in.gov.br/consulta)** e pesquise pelo nome da empresa
+        2. Ou acesse **[imprensaoficial.com.br](https://www.imprensaoficial.com.br)** e busque por "demonstrações financeiras"
+        3. Abra a publicação, selecione todo o texto (**Ctrl+A**) e copie (**Ctrl+C**)
+        4. Cole no campo abaixo e clique em **Processar**
+        5. O sistema identifica automaticamente: empresa, CNPJ, receita, EBITDA, lucro
+        """)
+    texto_manual = st.text_area(
+        "Cole aqui o texto do balanço / DF",
+        height=250,
+        placeholder="Cole aqui o texto copiado do DOU, Diário Oficial ou JUCE...",
+        key="manual_text"
+    )
+    col_proc, col_fonte = st.columns([1,2])
+    with col_fonte:
+        fonte_manual = st.text_input("Fonte (URL ou descrição)", value="DOU", key="manual_fonte")
+    with col_proc:
+        st.markdown("&nbsp;")
+        processar = st.button("🔍 Processar texto", type="primary", use_container_width=True)
+
+    if processar and texto_manual.strip():
+        with st.spinner("Extraindo dados financeiros..."):
+            resultados = process_manual_text(texto_manual, fonte_manual)
+        if not resultados:
+            st.warning(
+                "⚠️ Nenhuma empresa com EBITDA > R$ 40M encontrada no texto. "
+                "Verifique se o texto contém demonstração financeira completa com valores."
+            )
+            # Mostrar diagnóstico
+            tl = texto_manual.lower()
+            hits = [t for t in ["receita","ebitda","lucro","balanço","demonstraç"] if t in tl]
+            st.info(f"Termos financeiros detectados: {hits if hits else 'nenhum'}")
+        else:
+            st.success(f"✅ {len(resultados)} empresa(s) identificada(s)!")
+            for res in resultados:
+                cid = upsert_co({
+                    "cnpj": res.get("cnpj") or "SEM_CNPJ",
+                    "razao_social": res.get("company_name") or "Não identificada",
+                    "uf": res.get("fonte_uf","BR"), "municipio": None,
+                    "setor": inf_s(res.get("company_name","")),
+                    "tipo_sociedade": inf_t(res.get("company_name",""))
+                })
+                upsert_st(cid, res)
+                eb = (res.get("ebitda") or 0)/1e6
+                rec = (res.get("receita_liquida") or 0)/1e6
+                st.markdown(f"""
+                **{res.get('company_name','?')}**  
+                CNPJ: `{res.get('cnpj','N/D')}` · EBITDA: **R$ {eb:.0f}M** · Receita: R$ {rec:.0f}M  
+                Confiança: {res.get('confianca_extracao',0)*100:.0f}%
+                """)
+            st.info("Dados salvos! Vá para 🔍 Buscar Empresas para visualizar.")
+
+    st.markdown("---")
+    st.subheader("🤖 Coleta automatizada — InLabs DOU")
+    st.info("""
+**Como funciona:** O InLabs é a API oficial e gratuita da Imprensa Nacional.  
+Ela dá acesso direto a todos os XMLs do DOU sem bloqueio.  
+**Passo único:** Cadastre-se gratuitamente em [inlabs.in.gov.br](https://inlabs.in.gov.br) e coloque seu email e senha abaixo.
+""")
+    with st.expander("🔑 Credenciais InLabs", expanded=True):
+        c_email, c_senha = st.columns(2)
+        with c_email:
+            inlabs_email = st.text_input("Email cadastrado no InLabs",
+                                          placeholder="seu@email.com", key="inlabs_email")
+        with c_senha:
+            inlabs_senha = st.text_input("Senha do InLabs",
+                                          type="password", key="inlabs_senha")
+        st.caption("Suas credenciais ficam apenas nesta sessão — não são salvas em lugar nenhum.")
+
+    fs=st.multiselect("Fontes",list(SRCS.keys()),default=["InLabs DOU Seção 3"])
+    col_btn, col_info = st.columns([1,2])
+    with col_btn:
+        iniciar = st.button(f"🚀 Iniciar coleta ({len(fs)} fonte(s))",
+                            type="primary", disabled=len(fs)==0,
+                            use_container_width=True)
+    with col_info:
+        st.caption("⏱ Varre os últimos 365 dias do DOU Seção 3. Pode levar 1-3 horas rodando em segundo plano.")
+
+    if iniciar:
+        if not inlabs_email or not inlabs_senha:
+            st.error("⚠️ Preencha email e senha do InLabs antes de iniciar.")
+        else:
+            lb=st.empty(); pr=st.progress(0); al=[]
+            for i,nm in enumerate(fs):
+                pr.progress(int(i/len(fs)*100),text=f"Coletando: {nm}...")
+                url,uf=SRCS[nm]
+                def cb(m,_l=al): _l.append(m); lb.text_area("Log","\n".join(_l[-40:]),height=300)
+                collect(nm,url,uf,lcb=cb,email=inlabs_email,senha=inlabs_senha)
+            pr.progress(100,text="Concluído!"); st.success("✅ Coleta finalizada!")
     st.markdown("---"); st.subheader("📋 Histórico")
     runs=get_runs()
     if runs:
