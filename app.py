@@ -355,10 +355,20 @@ if "Dashboard" in pg:
                 fig2.update_layout(paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",coloraxis_showscale=False,margin=dict(l=0,r=0,t=0,b=0),height=280)
                 st.plotly_chart(fig2,use_container_width=True)
         st.markdown("---"); st.subheader("🏆 Top 10 por EBITDA")
-        for i,e in enumerate(qry(limit=10),1):
-            eb=(e["ebitda"] or 0)/1e6; mg=(e["margem_ebitda"] or 0)*100
-            bc="badge-green" if mg>=20 else("badge-yellow" if mg>=10 else"badge-red")
-            st.markdown(f"""<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;"><div><span style="color:#555;font-size:.75rem;">#{i}</span><span class="cn"> {e['razao_social']}</span><div class="cm">{e.get('uf','?')} · {e.get('setor','N/D')} · {e.get('tipo_sociedade','?')} · {e.get('ano_referencia','?')}</div></div><div style="text-align:right;"><div class="el">EBITDA</div><div class="ce">R$ {eb:.0f}M</div><span class="{bc}">{mg:.1f}% margem</span></div></div></div>""",unsafe_allow_html=True)
+        try:
+            top10=qry(limit=10)
+            for i,e in enumerate(top10,1):
+                eb=float(e.get("ebitda") or 0)/1e6
+                mg=float(e.get("margem_ebitda") or 0)*100
+                bc="badge-green" if mg>=20 else("badge-yellow" if mg>=10 else"badge-red")
+                nome=str(e.get("razao_social") or "N/D")
+                uf_=str(e.get("uf") or "?")
+                setor_=str(e.get("setor") or "N/D")
+                tipo_=str(e.get("tipo_sociedade") or "?")
+                ano_=str(e.get("ano_referencia") or "?")
+                st.markdown(f'''<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;"><div><span style="color:#555;font-size:.75rem;">#{i}</span><span class="cn"> {nome}</span><div class="cm">{uf_} · {setor_} · {tipo_} · {ano_}</div></div><div style="text-align:right;"><div class="el">EBITDA</div><div class="ce">R$ {eb:.0f}M</div><span class="{bc}">{mg:.1f}% margem</span></div></div></div>''',unsafe_allow_html=True)
+        except Exception as ex:
+            st.warning(f"Erro ao carregar Top 10: {ex}")
 
 # ─── BUSCAR ─────────────────────────────────────────────────────────
 elif "Buscar" in pg:
