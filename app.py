@@ -356,7 +356,7 @@ if "Dashboard" in pg:
                 st.plotly_chart(fig2,use_container_width=True)
         st.markdown("---"); st.subheader("🏆 Top 10 por EBITDA")
         try:
-            top10=qry(limit=10)
+            top10=qry(lim=10)
             for i,e in enumerate(top10,1):
                 eb=float(e.get("ebitda") or 0)/1e6
                 mg=float(e.get("margem_ebitda") or 0)*100
