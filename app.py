@@ -205,22 +205,62 @@ def _inlabs_collect(email, senha, sess, lcb=None):
     from datetime import datetime, timedelta
     results = []
 
-    # 1) Login
+    # 1) Login — testar múltiplos formatos de credencial
+    cookie = ""
     try:
-        r = sess.post(INLABS_LOGIN,
-                      data={"email": email, "senha": senha},
-                      timeout=15)
-        # Capturar cookie de sessão
+        # Tentar formato JSON primeiro (alguns endpoints preferem)
+        r_json = sess.post(INLABS_LOGIN,
+                           json={"email": email, "senha": senha},
+                           timeout=15)
+        if lcb: lcb(f"  🔍 Login JSON: status={r_json.status_code} cookies={dict(sess.cookies)}")
+
         cookie = sess.cookies.get("inlabs_session_cookie","")
+
         if not cookie:
-            # Tentar extrair do body
-            import re as re2
-            m = re2.search(r'inlabs_session_cookie["\s:=]+([a-zA-Z0-9_\-]+)', r.text)
-            cookie = m.group(1) if m else ""
+            # Tentar formato form-data
+            r_form = sess.post(INLABS_LOGIN,
+                               data={"email": email, "senha": senha,
+                                     "acao": "logar"},
+                               timeout=15,
+                               headers={**HDR, "Content-Type": "application/x-www-form-urlencoded"})
+            if lcb: lcb(f"  🔍 Login form: status={r_form.status_code} cookies={dict(sess.cookies)}")
+            cookie = sess.cookies.get("inlabs_session_cookie","")
+
+            if not cookie:
+                # Procurar token em qualquer cookie
+                all_cookies = dict(sess.cookies)
+                if lcb: lcb(f"  🔍 Todos os cookies: {all_cookies}")
+                # Pegar qualquer cookie que pareça um token
+                for k,v in all_cookies.items():
+                    if len(v) > 10:
+                        cookie = v
+                        if lcb: lcb(f"  ℹ️ Usando cookie '{k}'")
+                        break
+
+            if not cookie:
+                # Tentar extrair JWT do body da resposta
+                body = r_form.text
+                if lcb: lcb(f"  🔍 Body (primeiros 200 chars): {body[:200]}")
+                import re as re2
+                for pattern in [
+                    r'"token"\s*:\s*"([^"]+)"',
+                    r'"jwt"\s*:\s*"([^"]+)"',
+                    r'"access_token"\s*:\s*"([^"]+)"',
+                    r'inlabs_session_cookie[^=]*=([^\s;]+)',
+                ]:
+                    m = re2.search(pattern, body)
+                    if m:
+                        cookie = m.group(1)
+                        if lcb: lcb(f"  ℹ️ Token extraído do body: {cookie[:20]}...")
+                        break
+
         if not cookie:
-            if lcb: lcb("❌ Login InLabs falhou. Verifique email/senha em Configurações.")
+            if lcb: lcb("❌ Login InLabs falhou — cookie não encontrado. Verifique email/senha.")
+            if lcb: lcb("   Acesse inlabs.in.gov.br no navegador para confirmar que suas credenciais funcionam.")
             return results
-        if lcb: lcb("✅ InLabs: login OK")
+
+        if lcb: lcb(f"✅ InLabs: login OK — token obtido")
+
     except Exception as e:
         if lcb: lcb(f"❌ Login InLabs: {e}")
         return results
